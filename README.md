@@ -4,7 +4,7 @@ This model answers one question about a transaction: is this row harder for a ne
 
 The first notebook is synthetic. `generate_synthetic_transactions` in `src/fraudvae/dataset.py` draws credit-card-like rows: amounts, fees, distances, merchant ids, device types. It is not an external card-fraud dataset. Normal rows follow a few tight links (fee tracks amount, rolling spend falls as the gap since the last transaction grows, device follows distance, merchant follows spend). Fraud rows are drawn to break those links by a wide margin. On that generator the notebook's fraud recall is 1.0. That shows the pipeline fires when the assumptions hold. It does not show that the model would catch fraud in production. A second notebook runs the continuous-only model on the public Kaggle card file. That run is a different split and a different feature set; its numbers are in the section below.
 
-The notes in [docs/vae_theory.pdf](docs/vae_theory.pdf) derive the variational autoencoder, then walk through both notebooks, the knobs, and the recorded results. Source: [docs/vae_theory.tex](docs/vae_theory.tex). GitHub will open the PDF in its viewer. The equations live there, not in this file.
+The notes in [docs/vae_theory.pdf](docs/vae_theory.pdf) walk through both notebooks in plain language: what the model flags, what the knobs do, and what the recorded runs showed. The derivations are an appendix. Source: [docs/vae_theory.tex](docs/vae_theory.tex).
 
 ## What happens to one row
 
