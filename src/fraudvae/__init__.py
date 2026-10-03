@@ -9,8 +9,10 @@ The package is split the way a later service would be split:
 - train: offline loop, not part of a request path
 - score: reconstruction-error scoring and the frozen-threshold decision
 
-Training never sees fraud labels. A row is flagged when its reconstruction
-error exceeds a threshold fit on a pure-normal calibration set.
+The loss never receives the fraud label. On the Kaggle table, Class is used
+only to build the normal reference windows and to evaluate the holdout.
+A row is flagged when its reconstruction error exceeds a threshold fit on
+a pure-normal calibration set.
 """
 
 from fraudvae.dataset import (
@@ -27,6 +29,12 @@ from fraudvae.dataset import (
 from fraudvae.loss import LossConfig, VAELoss
 from fraudvae.model import TabularVAE
 from fraudvae.score import ReconstructionScorer, detection_report
+from fraudvae.real_data import (
+    FEATURE_COLUMNS,
+    CreditCardPreprocessor,
+    chronological_split,
+    load_creditcard_csv,
+)
 from fraudvae.train import VAETrainer, set_seed
 
 __all__ = [
@@ -35,7 +43,9 @@ __all__ = [
     "DEVICE_VOCAB",
     "MERCHANT_VOCAB",
     "ContinuousPreprocessor",
+    "FEATURE_COLUMNS",
     "FeatureSchema",
+    "CreditCardPreprocessor",
     "LossConfig",
     "ReconstructionScorer",
     "TabularVAE",
@@ -43,7 +53,9 @@ __all__ = [
     "TransactionDataset",
     "VAELoss",
     "VAETrainer",
+    "chronological_split",
     "detection_report",
     "generate_synthetic_transactions",
+    "load_creditcard_csv",
     "set_seed",
 ]

@@ -122,6 +122,10 @@ class ContinuousPreprocessor:
     validation rows.
     """
 
+    # Synthetic columns are positive magnitudes. The Kaggle preprocessor
+    # sets this false: Time may be 0 and the PCA components are signed.
+    require_positive = True
+
     def __init__(self, columns: tuple[str, ...] = CONTINUOUS_FEATURES) -> None:
         self.columns = columns
         self.mean_: np.ndarray | None = None
@@ -310,6 +314,8 @@ def encode_categoricals(frame: pd.DataFrame, schema: FeatureSchema = DEFAULT_SCH
     than the one the scorer expects.
     """
 
+    if not schema.categorical_names:
+        return np.zeros((len(frame), 0), dtype=np.int64)
     columns: list[np.ndarray] = []
     for name in schema.categorical_names:
         vocab = schema.vocab(name)

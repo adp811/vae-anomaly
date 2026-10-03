@@ -79,17 +79,22 @@ class VAELoss(nn.Module):
             delta=self.config.huber_delta,
             reduction="mean",
         )
-        if len(categorical_logits) != categorical.shape[1]:
+        n_columns = int(categorical.shape[1]) if categorical.ndim == 2 else 0
+        if len(categorical_logits) != n_columns:
             raise ValueError(
                 f"got {len(categorical_logits)} categorical heads for "
-                f"{categorical.shape[1]} categorical columns"
+                f"{n_columns} categorical columns"
             )
-        cross_entropy = torch.stack(
-            [
-                F.cross_entropy(logits, categorical[:, index], reduction="mean")
-                for index, logits in enumerate(categorical_logits)
-            ]
-        ).sum()
+        # No heads: the categorical term is exactly zero, not a dummy class.
+        if len(categorical_logits) == 0:
+            cross_entropy = recon_continuous.new_zeros(())
+        else:
+            cross_entropy = torch.stack(
+                [
+                    F.cross_entropy(logits, categorical[:, index], reduction="mean")
+                    for index, logits in enumerate(categorical_logits)
+                ]
+            ).sum()
         # -0.5 * sum_j (1 + logvar_j - mu_j^2 - exp(logvar_j)), then mean
         # over the batch. That is the usual diagonal-Gaussian KL, normalized
         # by batch size rather than left as a sum that scales with the batch.

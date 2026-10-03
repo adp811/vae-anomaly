@@ -2,7 +2,7 @@
 
 This model answers one question about a transaction: is this row harder for a network trained only on normal traffic to rebuild than almost all other normal rows? The answer is a reconstruction score and a boolean, `high_risk`. It is not a probability of fraud, and the fraud label is never an input to training.
 
-The table is synthetic. `generate_synthetic_transactions` in `src/fraudvae/dataset.py` draws credit-card-like rows: amounts, fees, distances, merchant ids, device types. It is not an external or real card-fraud dataset, and nothing in this repo was checked against real payments. Normal rows follow a few tight links (fee tracks amount, rolling spend falls as the gap since the last transaction grows, device follows distance, merchant follows spend). Fraud rows are drawn to break those links by a wide margin. On that generator the notebook's fraud recall is 1.0. That shows the pipeline fires when the assumptions hold. It does not show that the model would catch fraud in production.
+The first notebook is synthetic. `generate_synthetic_transactions` in `src/fraudvae/dataset.py` draws credit-card-like rows: amounts, fees, distances, merchant ids, device types. It is not an external card-fraud dataset. Normal rows follow a few tight links (fee tracks amount, rolling spend falls as the gap since the last transaction grows, device follows distance, merchant follows spend). Fraud rows are drawn to break those links by a wide margin. On that generator the notebook's fraud recall is 1.0. That shows the pipeline fires when the assumptions hold. It does not show that the model would catch fraud in production. A second notebook runs the continuous-only model on the public Kaggle card file. That run is a different split and a different feature set; its numbers are in the section below.
 
 The derivation, with dimensions at each step, is in [docs/vae_theory.pdf](docs/vae_theory.pdf). Source: [docs/vae_theory.tex](docs/vae_theory.tex). GitHub will open the PDF in its viewer. The equations live there, not in this file.
 
@@ -75,11 +75,39 @@ The merchant and device vocabularies are closed. An unseen id is a schema error,
 
 If the normal training rows contain fraud, the decoder learns to rebuild those patterns and the score goes quiet. The notebook split rejects that by construction. A real extract would not. The frozen threshold also goes stale when normal behavior drifts. Replacing 2.1162 requires a new normal calibration window, not a per-request percentile. And the score is not a calibrated probability. A value of 2.2 means "above the cutoff we stored," not "92% fraud."
 
+## Kaggle credit-card notebook
+
+[`notebooks/kaggle_credit_card_vae.ipynb`](notebooks/kaggle_credit_card_vae.ipynb) uses the public Kaggle Credit Card Fraud Detection file (`mlg-ulb/creditcardfraud`, `creditcard.csv`). The CSV is not in git. Place it at `data/creditcard.csv`. If it is missing, the notebook downloads it with `kagglehub`. If that call asks for a login, accept the dataset rules on Kaggle and put the token in `~/.kaggle/kaggle.json`. Do not commit the token or the CSV.
+
+This path is continuous only: `Time`, `V1`–`V28`, and `Amount`. There are no merchant or device heads and no categorical cross-entropy. `V1`–`V28` arrived as anonymized PCA components; this repo does not refit them. `Amount` is `log1p` then z-scored. `Time` and the PCA columns are z-scored without `log1p` (`Time` is a clock starting at 0, and the PCA scores are signed). The scaler is fit on the normal rows that enter training.
+
+The split follows `Time`, not a shuffle. The first 60% of rows is the training window, the next 20% is calibration, and the last 20% is the mixed holdout. Training and calibration keep `Class = 0`. Fraud in those windows is dropped, not moved into the holdout. Labels are used to build that normal reference and to evaluate. They are not in the loss. That is normal-only / semi-supervised anomaly detection.
+
+The score is the sum of the 30 Huber terms. KL is not included. The operating threshold is the 99th percentile of calibration scores. A 95th percentile would aim at flagging about 5% of normals, which is a lot of alarms at this base rate. The notebook also prints 95, 97, 99, and 99.5, all taken from calibration scores. An IsolationForest fit on the same scaled training normals, and calibrated on the same window, is the baseline.
+
+`MAX_TRAIN_NORMALS` was `None` for the recorded run, so all 170,524 training-window normals were used. Setting it to an integer subsamples those normals only. Evaluation fraud is never subsampled. The trunk is width 128 and `beta` is 0.01. The synthetic settings (`beta=0.1`, width 64) collapse on this table: the decoder rebuilds the training mean and the 6-dimensional code goes unused. Twelve epochs, seed 42, latent size 6. Final training Huber was 0.1382, against 0.3469 for predicting the scaled mean.
+
+On the chronological holdout (56,887 normal, 75 fraud; 360 fraud rows excluded from training and 57 from calibration):
+
+| Model | Precision | Recall | F1 | PR-AUC | ROC-AUC | Normal FPR |
+| --- | --- | --- | --- | --- | --- | --- |
+| VAE, 99th pct, threshold 34.7925 | 0.0998 | 0.5333 | 0.1681 | 0.0809 | 0.9384 | 0.0063 |
+| IsolationForest, 99th pct | 0.0470 | 0.2267 | 0.0778 | 0.0382 | 0.9528 | 0.0061 |
+
+VAE confusion on that holdout: TN 56526, FP 361, FN 35, TP 40. Flagged fraction 0.0070. Accuracy was 0.993. Calling every row normal is already 56887/56962 ≈ 0.9987, so accuracy is the wrong summary. Training took 14.9 seconds. The notebook's own timer for the full run was 18.3 seconds. These figures belong to this split of this 2013 file.
+
+```bash
+jupyter nbconvert --to notebook --execute --inplace notebooks/kaggle_credit_card_vae.ipynb
+```
+
 ## Layout
 
-- `src/fraudvae/dataset.py` — generator, splits, scaler, class indices
-- `src/fraudvae/model.py` — `TabularVAE`
+- `src/fraudvae/dataset.py` — synthetic generator, random normal-only splits, log1p scaler
+- `src/fraudvae/real_data.py` — Kaggle schema, chronological split, continuous scaler
+- `src/fraudvae/model.py` — `TabularVAE`, including the continuous-only case
 - `src/fraudvae/loss.py` — `LossConfig`, `VAELoss`
 - `src/fraudvae/train.py` — `VAETrainer`, which drops the label
 - `src/fraudvae/score.py` — `ReconstructionScorer.score`
-- `notebooks/zero_shot_fraud_vae.ipynb` — the run that produced the numbers above
+- `notebooks/zero_shot_fraud_vae.ipynb` — synthetic mixed-data run
+- `notebooks/kaggle_credit_card_vae.ipynb` — public card-file run
+- `tests/test_creditcard_pipeline.py` — split, scaler, scoring, and mixed-schema checks

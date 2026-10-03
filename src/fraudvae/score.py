@@ -30,8 +30,6 @@ import torch.nn.functional as F
 from sklearn.metrics import classification_report
 
 from fraudvae.dataset import (
-    CATEGORICAL_FEATURES,
-    CONTINUOUS_FEATURES,
     ContinuousPreprocessor,
     FeatureSchema,
     encode_categoricals,
@@ -111,7 +109,14 @@ class ReconstructionScorer:
             raise TypeError("score_batch expects a list of transaction dicts")
         if len(transactions) == 0:
             return []
-        frame = pd.concat([_transaction_frame(item) for item in transactions], ignore_index=True)
+        require_positive = bool(getattr(self.preprocessor, "require_positive", True))
+        frame = pd.concat(
+            [
+                _transaction_frame(item, self.schema, require_positive=require_positive)
+                for item in transactions
+            ],
+            ignore_index=True,
+        )
         scored = self.score_frame(frame)
         return [self._result_from_row(scored.iloc[index]) for index in range(len(scored))]
 
@@ -185,12 +190,16 @@ class ReconstructionScorer:
             delta=self.loss_config.huber_delta,
             reduction="none",
         ).sum(dim=-1)
-        per_head = [
-            F.cross_entropy(logits, categorical_tensor[:, index], reduction="none")
-            for index, logits in enumerate(categorical_logits)
-        ]
-        categorical_matrix = torch.stack(per_head, dim=-1)
-        categorical_error = categorical_matrix.sum(dim=-1)
+        if categorical_logits:
+            per_head = [
+                F.cross_entropy(logits, categorical_tensor[:, index], reduction="none")
+                for index, logits in enumerate(categorical_logits)
+            ]
+            categorical_matrix = torch.stack(per_head, dim=-1)
+            categorical_error = categorical_matrix.sum(dim=-1)
+        else:
+            categorical_error = torch.zeros(continuous_tensor.shape[0], device=self.device)
+            categorical_matrix = categorical_error.new_zeros((continuous_tensor.shape[0], 0))
         reconstruction_error = (
             self.loss_config.lambda_cont * continuous_error
             + self.loss_config.lambda_cat * categorical_error
@@ -205,6 +214,45 @@ class ReconstructionScorer:
         for index, name in enumerate(self.schema.categorical_names):
             data[f"categorical_error_{name}"] = per_head_numpy[:, index]
         return pd.DataFrame(data)
+
+    def continuous_feature_huber(self, frame: pd.DataFrame, batch_size: int = 1024) -> pd.DataFrame:
+        """Per-feature Huber terms that sum to ``continuous_error``.
+
+        Same ``decode(mu)`` path as the score. Columns follow the schema's
+        continuous order. ``lambda_cont`` is not applied here; with the
+        default weight of 1 these terms are the continuous contribution.
+        """
+
+        self.model.eval()
+        continuous = self.preprocessor.transform(frame)
+        categorical = encode_categoricals(frame, self.schema)
+        names = list(self.schema.continuous_features)
+        pieces: list[pd.DataFrame] = []
+        for start in range(0, len(frame), batch_size):
+            stop = min(start + batch_size, len(frame))
+            pieces.append(self._feature_huber_numpy(continuous[start:stop], categorical[start:stop], names))
+        scored = pd.concat(pieces, ignore_index=True)
+        scored.index = frame.index
+        return scored
+
+    @torch.no_grad()
+    def _feature_huber_numpy(
+        self,
+        continuous: np.ndarray,
+        categorical: np.ndarray,
+        names: list[str],
+    ) -> pd.DataFrame:
+        continuous_tensor = torch.as_tensor(continuous, dtype=torch.float32, device=self.device)
+        categorical_tensor = torch.as_tensor(categorical, dtype=torch.long, device=self.device)
+        mu, _logvar = self.model.encode(continuous_tensor, categorical_tensor)
+        recon_continuous, _logits = self.model.decode(mu)
+        per_feature = F.huber_loss(
+            recon_continuous,
+            continuous_tensor,
+            delta=self.loss_config.huber_delta,
+            reduction="none",
+        )
+        return pd.DataFrame(per_feature.detach().cpu().numpy(), columns=names)
 
 
 def detection_report(labels: np.ndarray, high_risk: np.ndarray) -> str:
@@ -253,21 +301,26 @@ def text_histogram(scores: np.ndarray, bins: int = 12, width: int = 40) -> str:
     return "\n".join(lines)
 
 
-def _transaction_frame(transaction: dict) -> pd.DataFrame:
-    required = (*CONTINUOUS_FEATURES, *CATEGORICAL_FEATURES)
+def _transaction_frame(
+    transaction: dict,
+    schema: FeatureSchema,
+    require_positive: bool,
+) -> pd.DataFrame:
+    required = (*schema.continuous_features, *schema.categorical_names)
     missing = [name for name in required if name not in transaction]
     if missing:
         raise ValueError(f"transaction is missing required fields: {missing}")
     row: dict[str, object] = {}
-    for name in CONTINUOUS_FEATURES:
+    for name in schema.continuous_features:
         value = transaction[name]
         try:
             numeric = float(value)
         except (TypeError, ValueError) as exc:
-            raise ValueError(f"{name} must be a finite number > 0, got {value!r}") from exc
-        if not np.isfinite(numeric) or numeric <= 0:
-            raise ValueError(f"{name} must be a finite number > 0, got {value!r}")
+            raise ValueError(f"{name} must be a finite number, got {value!r}") from exc
+        if not np.isfinite(numeric) or (require_positive and numeric <= 0):
+            expectation = "a finite number > 0" if require_positive else "a finite number"
+            raise ValueError(f"{name} must be {expectation}, got {value!r}")
         row[name] = numeric
-    for name in CATEGORICAL_FEATURES:
+    for name in schema.categorical_names:
         row[name] = transaction[name]
     return pd.DataFrame([row])

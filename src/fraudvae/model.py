@@ -26,6 +26,8 @@ class TabularVAE(nn.Module):
     cat_cardinalities:
         Class counts in categorical-feature order. Merchant then device is
         (10, 3) for the synthetic schema. One-hot width is the sum.
+        An empty tuple is the continuous-only model: no categorical heads
+        and no dummy category.
     latent_dim:
         Size of z. Default is 6. The normal table is generated from about
         three factors, so this is still a bottleneck on the 18-wide
@@ -46,7 +48,9 @@ class TabularVAE(nn.Module):
             raise ValueError("latent_dim must be positive")
         if n_continuous < 1:
             raise ValueError("n_continuous must be positive")
-        if not cat_cardinalities or any(card < 2 for card in cat_cardinalities):
+        # Empty is the continuous-only case. A present feature still needs
+        # two classes; a one-class head would make cross-entropy meaningless.
+        if any(card < 2 for card in cat_cardinalities):
             raise ValueError("each categorical feature needs at least 2 classes")
 
         self.n_continuous = n_continuous
@@ -93,11 +97,26 @@ class TabularVAE(nn.Module):
         uses the same order) rather than assembling its own concatenation.
         """
 
-        one_hots = [
-            F.one_hot(categorical[:, index], num_classes=card).to(dtype=continuous.dtype)
-            for index, card in enumerate(self.cat_cardinalities)
-        ]
-        encoded = torch.cat([continuous, *one_hots], dim=-1)
+        if categorical.ndim != 2:
+            raise ValueError("categorical must be a 2D class-index tensor")
+        if len(self.cat_cardinalities) == 0:
+            if categorical.shape[1] != 0:
+                raise ValueError(
+                    "continuous-only model expects categorical shape [batch, 0], "
+                    f"got {tuple(categorical.shape)}"
+                )
+            encoded = continuous
+        else:
+            if categorical.shape[1] != len(self.cat_cardinalities):
+                raise ValueError(
+                    f"expected {len(self.cat_cardinalities)} categorical columns, "
+                    f"got {categorical.shape[1]}"
+                )
+            one_hots = [
+                F.one_hot(categorical[:, index], num_classes=card).to(dtype=continuous.dtype)
+                for index, card in enumerate(self.cat_cardinalities)
+            ]
+            encoded = torch.cat([continuous, *one_hots], dim=-1)
         hidden = self.encoder(encoded)
         mu = self.fc_mu(hidden)
         # Clamp before exp(logvar) in the KL term. A healthy train run stays
