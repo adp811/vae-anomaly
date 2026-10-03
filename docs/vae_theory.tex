@@ -1,0 +1,642 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb,booktabs,array}
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta,positioning}
+\usepackage[hidelinks]{hyperref}
+\emergencystretch=3em
+
+\title{What this VAE computes\\[0.4em]
+\large From a transaction row to a high-risk flag}
+\author{Notes on the \texttt{vae-anomaly} implementation}
+\date{Recorded notebook run at commit \texttt{1bae41a}\\
+seed 42, CPU, 25 epochs}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+This note walks one synthetic card transaction through the code in
+\texttt{src/fraudvae/}. It is not a general VAE textbook. Every width
+below is the width in \texttt{TabularVAE}, \texttt{VAELoss}, and
+\texttt{ReconstructionScorer}. The fraud label is never an input to
+training. A row is flagged when its reconstruction score is at least the
+frozen 95th percentile of a pure-normal calibration set.
+\end{abstract}
+
+\section{What you are looking at}
+
+The notebook \texttt{notebooks/zero\_shot\_fraud\_vae.ipynb} builds
+8{,}000 synthetic rows (7{,}600 normal, 400 fraud, about 5\%), fits a
+small tabular variational autoencoder on normal rows only, and then
+scores a mixed validation set. The package split is the same one a later
+service would keep:
+
+\begin{center}
+\small
+\begin{tabular}{@{}ll@{}}
+\toprule
+File & Role \\
+\midrule
+\texttt{dataset.py} & synthetic rows, splits, \texttt{log1p} scaler, one-hot indices \\
+\texttt{model.py} & \texttt{TabularVAE}: encoder, reparameterization, branched decoder \\
+\texttt{loss.py} & \texttt{LossConfig} and \texttt{VAELoss} \\
+\texttt{train.py} & \texttt{VAETrainer}, which drops the label \\
+\texttt{score.py} & \texttt{ReconstructionScorer.score} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Defaults used by that notebook, and by every number in this note:
+latent size 6, hidden width 64, Huber $\delta = 1$,
+$\lambda_{\mathrm{cont}} = 1$, $\lambda_{\mathrm{cat}} = 1$, $\beta = 0.1$,
+25 epochs, Adam learning rate $10^{-3}$, batch size 128.
+
+\section{Notation}
+\label{sec:notation}
+
+\begin{center}
+\small
+\begin{tabular}{@{}lp{0.62\textwidth}@{}}
+\toprule
+Symbol & Meaning in this repo \\
+\midrule
+$u \in \mathbb{R}^{5}_{>0}$ &
+Raw continuous fields, in column order:
+\texttt{amount}, \texttt{fee}, \texttt{rolling\_spend\_24h},
+\texttt{distance\_from\_home\_km}, \texttt{seconds\_since\_last\_txn}. \\
+$c_{\mathrm{m}} \in \{0,\ldots,9\}$ &
+\texttt{merchant\_id} index. Token \texttt{m0} is 0, \texttt{m9} is 9. \\
+$c_{\mathrm{d}} \in \{0,1,2\}$ &
+\texttt{device\_type} index. Order is \texttt{chip}, \texttt{contactless}, \texttt{online}. \\
+$\tilde{u} \in \mathbb{R}^{5}$ &
+\texttt{log1p} then z-score of $u$, using mean and std fit on train normals only. \\
+$x \in \mathbb{R}^{18}$ &
+Encoder input: $\tilde{u}$, then the merchant one-hot, then the device one-hot. \\
+$z \in \mathbb{R}^{6}$ &
+Latent code. \\
+$q_{\phi}(z \mid x)$ &
+Encoder Gaussian $\mathcal{N}(\mu, \operatorname{diag}(\exp(\mathrm{logvar})))$. $\phi$ is the encoder weights. \\
+$p(z)$ &
+Prior $\mathcal{N}(0, I_{6})$. Not learned. \\
+$p_{\theta}(x \mid z)$ &
+Decoder. In the writeup this is the generative model. In the loss it is replaced by Huber plus categorical cross-entropy. $\theta$ is the decoder weights. \\
+$y$ &
+Hidden label, 0 normal and 1 fraud. Not an argument of \texttt{VAELoss}. \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\section{Running example}
+
+Two hand-written rows from the notebook. The first sits on the normal
+generator (fee tracks amount, rolling spend matches a gap of about two
+hours, merchant \texttt{m3}, device \texttt{contactless}). The second
+breaks those links (large amount, fee that does not follow it, long gap
+with high rolling spend, far from home, merchant \texttt{m8}, device
+\texttt{chip}).
+
+\begin{center}
+\small
+\begin{tabular}{@{}lrr@{}}
+\toprule
+Field & On-manifold row & Off-manifold row \\
+\midrule
+\texttt{amount} & 24.5 & 280 \\
+\texttt{fee} & 0.50 & 1.2 \\
+\texttt{rolling\_spend\_24h} & 57 & 900 \\
+\texttt{distance\_from\_home\_km} & 3 & 80 \\
+\texttt{seconds\_since\_last\_txn} & 6600 & 80000 \\
+\texttt{merchant\_id} & \texttt{m3} (index 3) & \texttt{m8} (index 8) \\
+\texttt{device\_type} & \texttt{contactless} (index 1) & \texttt{chip} (index 0) \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+The scaler printed by the notebook, rounded to three decimals, was
+\[
+\begin{aligned}
+m &= (3.246,\ 0.432,\ 4.068,\ 1.420,\ 8.813), \\
+s &= (0.478,\ 0.179,\ 0.563,\ 0.375,\ 0.504).
+\end{aligned}
+\]
+Those are the training-normal mean and population standard deviation of
+$\log(1+u)$, column by column. Applying them at that printed precision
+gives
+\[
+\begin{aligned}
+\tilde{u}_{\text{on}} &\approx (-0.02,\ -0.15,\ -0.01,\ -0.09,\ -0.04), \\
+\tilde{u}_{\text{off}} &\approx (5.01,\ 1.99,\ 4.86,\ 7.93,\ 4.91).
+\end{aligned}
+\]
+The on-manifold row is near the origin of the scaled space. The
+off-manifold row is several training standard deviations out on every
+continuous column, and about eight on distance. That gap is built into
+the synthetic generator. Section~\ref{sec:results} says what that implies
+for the perfect fraud recall.
+
+\section{From a raw row to an 18-vector}
+\label{sec:input}
+
+\texttt{ContinuousPreprocessor} in \texttt{dataset.py} does two steps and
+then stops.
+
+\begin{enumerate}
+\item Reject the row if any continuous value is non-finite or not strictly
+positive. Zero is rejected. There is no clamp.
+\item $\tilde{u}_{j} = (\log(1+u_{j}) - m_{j}) / s_{j}$ for $j = 1,\ldots,5$.
+\end{enumerate}
+
+\texttt{fit} runs only on the 5{,}200 normal training rows.
+\texttt{TransactionDataModule} then calls \texttt{transform} on
+calibration and validation. \texttt{ReconstructionScorer} calls the same
+\texttt{transform}. Refitting on fraud, on the validation mix, or inside
+\texttt{score} would be a different model.
+
+Categorical strings become indices in \texttt{encode\_categoricals}.
+The vocab order is the class order:
+
+\begin{itemize}
+\item \texttt{merchant\_id}: \texttt{m0}, \texttt{m1}, \ldots, \texttt{m9}.
+\item \texttt{device\_type}: \texttt{chip}, \texttt{contactless}, \texttt{online}.
+\end{itemize}
+
+An unknown token raises. It is not mapped to a zero vector.
+
+\texttt{TabularVAE.encode} builds the one-hots and concatenates. For the
+on-manifold example, $c_{\mathrm{m}} = 3$ and $c_{\mathrm{d}} = 1$, so the
+18-vector is
+\[
+x =
+\big[
+\tilde{u}
+\;\big|\;
+e_{3}^{(10)}
+\;\big|\;
+e_{1}^{(3)}
+\big]
+\in \mathbb{R}^{18},
+\]
+where $e_{3}^{(10)}$ is the length-10 vector with a 1 in position 3
+(0-based) and $e_{1}^{(3)}$ is $(0,1,0)$. Five continuous coordinates, ten
+merchant coordinates, three device coordinates. That 18 is
+$5 + 10 + 3$, not a tuned hyperparameter.
+
+\section{Encoder: 18 to 64 to 64 to two vectors of 6}
+
+\texttt{TabularVAE.encoder} is two linear layers with a ReLU after each:
+\[
+\begin{aligned}
+h_{1} &= \operatorname{ReLU}(W_{1} x + b_{1}), & W_{1} &\in \mathbb{R}^{64 \times 18}, \\
+h_{2} &= \operatorname{ReLU}(W_{2} h_{1} + b_{2}), & W_{2} &\in \mathbb{R}^{64 \times 64}.
+\end{aligned}
+\]
+Two more linear maps, with no activation, read $h_{2}$:
+\[
+\mu = W_{\mu} h_{2} + b_{\mu}, \qquad
+\mathrm{logvar} = \operatorname{clamp}\big(W_{\lambda} h_{2} + b_{\lambda},\, -10,\, 10\big),
+\]
+both in $\mathbb{R}^{6}$. The clamp is only there so $\exp(\mathrm{logvar})$
+cannot overflow. A healthy run stays far inside $[-10, 10]$.
+
+This defines the approximate posterior
+\[
+q_{\phi}(z \mid x)
+= \mathcal{N}\!\big(\mu,\ \operatorname{diag}(\exp(\mathrm{logvar}))\big).
+\]
+The diagonal has six entries. There is no covariance between latent
+coordinates. $\phi$ means every encoder weight above, including
+$W_{\mu}$ and $W_{\lambda}$.
+
+\section{Why the marginal likelihood is intractable}
+
+The generative story the math starts from is
+\[
+z \sim p(z) = \mathcal{N}(0, I_{6}),
+\qquad
+x \sim p_{\theta}(x \mid z).
+\]
+The quantity we would like, for a single observed row, is the marginal
+\[
+p_{\theta}(x)
+= \int p_{\theta}(x \mid z)\, p(z)\, dz.
+\]
+That integral is six-dimensional. $p_{\theta}(x \mid z)$ is a neural net,
+not a conjugate density, so there is no closed form. A junior-engineer
+reading of ``intractable'' here is narrow and concrete: we cannot evaluate
+or differentiate $\log p_{\theta}(x)$ by summing a finite table, because
+$z$ is continuous and the decoder is a stack of ReLUs. The evidence lower
+bound replaces that integral with something the code can differentiate.
+
+\section{ELBO, then the loss this repo actually minimizes}
+\label{sec:elbo}
+
+Start from the marginal and insert the encoder density, which integrates
+to one:
+\[
+\log p_{\theta}(x)
+= \log \int q_{\phi}(z \mid x)\,
+\frac{p_{\theta}(x \mid z)\, p(z)}{q_{\phi}(z \mid x)}\, dz
+= \log \mathbb{E}_{q_{\phi}(z \mid x)}
+\left[
+\frac{p_{\theta}(x \mid z)\, p(z)}{q_{\phi}(z \mid x)}
+\right].
+\]
+$\log$ is concave, so Jensen's inequality moves it inside the expectation
+and produces a lower bound:
+\[
+\log p_{\theta}(x)
+\ge
+\mathbb{E}_{q_{\phi}(z \mid x)}\big[\log p_{\theta}(x \mid z)\big]
+- \mathrm{KL}\big(q_{\phi}(z \mid x) \,\|\, p(z)\big).
+\]
+The right-hand side is $\operatorname{ELBO}(x)$. Training would ideally
+maximize it, which is the same as minimizing its negative.
+
+Read the two pieces the way the optimizer feels them.
+
+\begin{itemize}
+\item The expectation is the reconstruction term. For the $z$ the encoder
+just proposed, the decoder has to assign high probability to the row that
+was actually observed: the five scaled continuous values and the two class
+indices.
+\item The KL term keeps $q_{\phi}(z \mid x)$ near $\mathcal{N}(0, I_{6})$.
+Without it the encoder can give every row its own far-away code and the
+decoder can memorize those codes one by one. With it, normal rows have to
+share one region of $\mathbb{R}^{6}$, which is the region the decoder
+learns to read.
+\end{itemize}
+
+\texttt{VAELoss} does \emph{not} implement $-\operatorname{ELBO}$ with a
+single likelihood. The continuous head has no variance output, and the
+continuous penalty is Huber loss rather than a Gaussian log-density.
+Cross-entropy on the categorical heads \emph{is} a negative log-likelihood,
+for a categorical distribution whose logits the decoder emits. The KL term
+\emph{is} the exact closed form for a diagonal Gaussian against
+$\mathcal{N}(0, I_{6})$, then multiplied by $\beta = 0.1$ instead of the
+ELBO's implicit weight of 1.
+
+So the implemented objective is a practical mixed-data surrogate for the
+negative expected log-likelihood, plus a downweighted KL. Huber plus
+cross-entropy stand in for $-\mathbb{E}[\log p_{\theta}(x \mid z)]$. They
+are not themselves one joint density evaluated at $x$.
+
+\section{Reparameterization, and why scoring skips it}
+
+The reconstruction term has to be estimated by a sample from
+$q_{\phi}(z \mid x)$, and that sample still has to carry a gradient into
+$\mu$ and $\mathrm{logvar}$. \texttt{TabularVAE.reparameterize} writes the
+sample as a deterministic function of a parameter-free noise variable:
+\[
+\sigma = \exp(0.5 \cdot \mathrm{logvar}),
+\qquad
+\epsilon \sim \mathcal{N}(0, I_{6}),
+\qquad
+z = \mu + \sigma \odot \epsilon.
+\]
+$\odot$ is elementwise. \texttt{forward} is the training path: encode,
+draw $z$, decode. The KL term does not need $\epsilon$. It is computed
+from $\mu$ and $\mathrm{logvar}$ in closed form. The sample exists so the
+reconstruction term can push on the encoder.
+
+\texttt{ReconstructionScorer} does not call \texttt{reparameterize}. It
+encodes, ignores $\mathrm{logvar}$ for the draw, and calls
+\texttt{decode(mu)}. The score is then a function of the row and the
+weights only. A fresh $\epsilon$ on every request would move the score and
+make the frozen threshold a moving target.
+
+\section{Decoder: 6 to 64 to 64, then three heads}
+
+\texttt{decode} maps $z \in \mathbb{R}^{6}$ through the same shape of trunk
+as the encoder, pointed the other way:
+\[
+\begin{aligned}
+g_{1} &= \operatorname{ReLU}(W_{3} z + b_{3}), & W_{3} &\in \mathbb{R}^{64 \times 6}, \\
+g_{2} &= \operatorname{ReLU}(W_{4} g_{1} + b_{4}), & W_{4} &\in \mathbb{R}^{64 \times 64}.
+\end{aligned}
+\]
+Three linear heads read $g_{2}$. None of them has a softmax or a sigmoid.
+
+\begin{center}
+\small
+\begin{tabular}{@{}llp{0.48\textwidth}@{}}
+\toprule
+Head & Map & Output \\
+\midrule
+\texttt{continuous\_head} & $\mathbb{R}^{64} \to \mathbb{R}^{5}$ &
+scaled \texttt{amount}, \texttt{fee}, \texttt{rolling\_spend\_24h},
+\texttt{distance\_from\_home\_km}, \texttt{seconds\_since\_last\_txn} \\
+merchant head & $\mathbb{R}^{64} \to \mathbb{R}^{10}$ & raw logits \\
+device head & $\mathbb{R}^{64} \to \mathbb{R}^{3}$ & raw logits \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\texttt{F.cross\_entropy} applies the log-softmax. Putting a softmax in
+the module would feed probabilities into that function and break the loss.
+The continuous head is linear because its targets are z-scores: on normal
+rows they sit near 0 and are unbounded in principle.
+
+\section{The batch loss, exactly}
+\label{sec:loss}
+
+For a batch of $B$ rows, \texttt{VAELoss.forward} returns four scalars:
+\texttt{total}, \texttt{huber}, \texttt{cross\_entropy}, \texttt{kl}.
+The three components are unweighted. \texttt{total} applies
+\texttt{LossConfig}.
+
+\paragraph{Huber.}
+\texttt{F.huber\_loss} with $\delta = 1$ and \texttt{reduction="mean"}.
+That mean runs over the batch and over the five continuous columns, so
+each of the $5B$ residuals counts equally. With $\delta = 1$ in the
+already standardized space, the kink is one training standard deviation
+of normal $\log(1+u)$ traffic. Inside the kink the penalty is quadratic.
+Outside it the slope is constant:
+\[
+\ell_{\delta}(r) =
+\begin{cases}
+\tfrac{1}{2} r^{2} & |r| \le 1, \\
+|r| - \tfrac{1}{2} & |r| > 1.
+\end{cases}
+\]
+Squared error would keep growing with $r^{2}$. A few legitimately large
+normal amounts, even after \texttt{log1p}, would dominate the gradient.
+Huber still penalizes them. The slope stays bounded.
+
+\paragraph{Cross-entropy.}
+For each head, \texttt{F.cross\_entropy} with \texttt{reduction="mean"}
+averages over the batch only. The two head-means are then summed. Merchant
+and device each contribute. Because a sum of means is the mean of the sum,
+this is also the batch mean of
+$(\mathrm{CE}_{\mathrm{merchant}} + \mathrm{CE}_{\mathrm{device}})$ on
+each row. The class target is the integer index, not a one-hot.
+
+\paragraph{KL.}
+For row $i$ and latent coordinate $j = 1,\ldots,6$,
+\[
+\mathrm{KL}_{i}
+= -\frac{1}{2} \sum_{j=1}^{6}
+\Big(
+1 + \mathrm{logvar}_{i,j}
+- \mu_{i,j}^{2}
+- \exp(\mathrm{logvar}_{i,j})
+\Big),
+\qquad
+\mathrm{KL}
+= \frac{1}{B} \sum_{i=1}^{B} \mathrm{KL}_{i}.
+\]
+Sum over the six latent dimensions, then mean over the batch. A sum over
+the batch would grow when the batch grew, and the loss would not be
+comparable across the last short batch. \texttt{VAETrainer} reweights
+epoch averages by batch size for that reason.
+
+\paragraph{Total.}
+\[
+\mathrm{total}
+= 1 \cdot \mathrm{Huber}
++ 1 \cdot (\mathrm{CE}_{\mathrm{merchant}} + \mathrm{CE}_{\mathrm{device}})
++ 0.1 \cdot \mathrm{KL}.
+\]
+$\beta = 0.1$ rather than 1 so the KL term does not take the whole
+objective while the decoder is still learning the normal manifold. At
+epoch 1 of the recorded run the unweighted pieces were about
+Huber $0.422$ and cross-entropy $3.270$ (near $\log 10 + \log 3$) against
+KL $0.048$. The reconstruction terms did fall. By epoch 25 the printed
+line was
+\[
+\mathrm{total} = 0.8791,\quad
+\mathrm{Huber} = 0.2116,\quad
+\mathrm{CE} = 0.0861,\quad
+\mathrm{KL} = 5.8136.
+\]
+After the weights, that is Huber $0.2116$, cross-entropy $0.0861$, and
+$\beta \cdot \mathrm{KL} = 0.5814$. The weighted KL term was larger than
+Huber and cross-entropy together ($0.2977$). That is a fact about this
+run, not a reason to put KL into the anomaly score. The reconstruction
+terms had already dropped. KL stayed a training regularizer.
+Section~\ref{sec:score} leaves it out of the score on purpose.
+
+\section{Why normal-only training is the detector}
+
+\texttt{generate\_synthetic\_transactions} draws both classes.
+\texttt{TransactionDataModule} then cuts them apart. The notebook split of
+the 7{,}600 normals is 5{,}200 train, 1{,}200 calibration, 1{,}200
+validation. All 400 fraud rows go to validation. The module checks that
+train and calibration are entirely label 0, and that no \texttt{row\_id}
+is shared.
+
+\texttt{VAETrainer.fit} unpacks \texttt{(continuous, categorical, labels)}
+and does not pass \texttt{labels} into the model or the loss. $\phi$ and
+$\theta$ are fit only to normal traffic: fee tracks amount, rolling 24h
+spend falls as the gap grows, device follows distance, merchant follows
+spend. Those links are the generator in \texttt{dataset.py}, documented
+there so the synthetic shift is not a surprise.
+
+A fraud row still has an encoder and a decoder. The encoder proposes a
+$z$. The decoder emits the reconstruction it learned from normals. Huber
+and cross-entropy come out higher because that reconstruction is a
+normal-like row and the inputs are not. The label is used only afterward,
+in \texttt{detection\_report}, to compute precision, recall, and F1.
+Nothing in the training loop classifies.
+
+\section{Per-row score and the frozen threshold}
+\label{sec:score}
+
+\texttt{ReconstructionScorer.reconstruction\_errors} uses a different
+reduction from \texttt{VAELoss}, on purpose. Training logged means so the
+optimizer saw a stable scale. The threshold lives on one number per row.
+
+For a single row, with $\delta = 1$:
+\[
+\begin{aligned}
+\mathrm{Huber}_{\mathrm{sum}}
+&= \sum_{j=1}^{5} \ell_{1}(\hat{u}_{j} - \tilde{u}_{j}), \\
+\mathrm{CE}_{\mathrm{sum}}
+&= \mathrm{CE}(\mathrm{logits}_{\mathrm{m}}, c_{\mathrm{m}})
++ \mathrm{CE}(\mathrm{logits}_{\mathrm{d}}, c_{\mathrm{d}}), \\
+\mathrm{score}
+&= \lambda_{\mathrm{cont}} \cdot \mathrm{Huber}_{\mathrm{sum}}
++ \lambda_{\mathrm{cat}} \cdot \mathrm{CE}_{\mathrm{sum}}.
+\end{aligned}
+\]
+With the default weights the score is the sum of five Huber residuals and
+two cross-entropies. KL is not added. \texttt{decode} is called on $\mu$,
+not on a sample.
+
+\texttt{fit\_threshold} runs that score on the 1{,}200 pure-normal
+calibration rows and stores the 95th percentile. In the recorded run the
+notebook printed
+\[
+\text{threshold} = 2.1162
+\]
+(the full float on the scorer was $2.116162061691284$). Those 1{,}200 rows
+were not used to fit $\phi$ or $\theta$, and they are not the rows the
+classification report uses. Later calls only read the stored float.
+\texttt{score} does not recompute a percentile.
+
+\texttt{high\_risk} is true when $\mathrm{score} \ge \mathrm{threshold}$.
+The comparison is greater-than-or-equal. On the dataframe path the flag
+text is \texttt{High-Risk Anomaly}.
+
+\texttt{score} returns five fields:
+\texttt{reconstruction\_error},
+\texttt{threshold},
+\texttt{high\_risk},
+\texttt{continuous\_error},
+and \texttt{categorical\_error}
+(a dict with \texttt{merchant\_id} and \texttt{device\_type}).
+\texttt{score\_batch} is the same function over a list.
+
+On the two running examples the notebook printed approximately $0.052$
+(not high-risk) and $25.95$ (high-risk), both against threshold $2.1162$.
+
+KL stays out of the score because it answers a different question: how far
+$q_{\phi}(z \mid x)$ sits from $\mathcal{N}(0, I_{6})$, not whether the
+row was rebuilt. By epoch 25 that term already outweighed reconstruction
+in the training objective. Adding it would rank rows by posterior
+geometry, including rows the decoder reconstructed cleanly, and the
+calibration percentile would no longer be a percentile of reconstruction
+error.
+
+\section{What the validation numbers do and do not say}
+\label{sec:results}
+
+The mixed validation set is 1{,}200 held-out normals plus all 400 fraud
+rows. \texttt{sklearn} classification report from that run, positive
+class fraud:
+
+\begin{center}
+\small
+\begin{tabular}{@{}lrrrr@{}}
+\toprule
+Class & Precision & Recall & F1 & Support \\
+\midrule
+Normal & 1.000 & 0.956 & 0.977 & 1200 \\
+Fraud & 0.883 & 1.000 & 0.938 & 400 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Accuracy was 0.967. The flag rate was 0.044 on validation normals and
+1.000 on validation fraud. A score with no class signal, thresholded at
+the 95th percentile, would flag about 5\% of fraud. Recall 1.0 beats that
+chance baseline by a wide margin \emph{on this generator}.
+
+It is a sanity check, not a production operating point. Fraud rows were
+drawn to be jointly unlikely under the normal process: shifted continuous
+margins and broken links, not a relabeling of ordinary rows. On the
+validation set the mean scaled normal vector was about zero, while the
+mean scaled fraud vector was about
+$(4.9,\ 2.3,\ 4.8,\ 7.9,\ 4.7)$.
+Fraud reconstruction scores ran from about 13.2 to 30.9, all above
+2.1162. Normal validation scores had a 95th percentile near 2.04, so a
+few normals still cross the calibration threshold. Those are the false
+positives behind fraud precision 0.883.
+
+If a later table of real transactions produces a weak F1, the useful
+reading is that the generator or the loss balance changed, not that this
+recall transfers to a book of card payments.
+
+\section{Pipeline}
+
+\begin{figure}[ht]
+\centering
+\begin{tikzpicture}[
+  font=\small,
+  node distance=0.45cm,
+  box/.style={draw, rounded corners=2pt, align=center, inner sep=5pt, text width=7.6cm},
+  arr/.style={-{Stealth[length=2mm]}, thick}
+]
+\node[box] (raw) {raw row: $u \in \mathbb{R}^{5}_{>0}$, merchant id, device type};
+\node[box, below=of raw] (prep) {\texttt{log1p} + train-normal z-score, one-hots $\rightarrow x \in \mathbb{R}^{18}$};
+\node[box, below=of prep] (enc) {encoder $18 \rightarrow 64 \rightarrow 64 \rightarrow (\mu, \mathrm{logvar}) \in \mathbb{R}^{6} \times \mathbb{R}^{6}$};
+\node[box, below=of enc] (z) {train: $z = \mu + \sigma \odot \epsilon$ \quad score: $z = \mu$};
+\node[box, below=of z] (dec) {decoder $6 \rightarrow 64 \rightarrow 64$, heads $\mathbb{R}^{5}$, $\mathbb{R}^{10}$, $\mathbb{R}^{3}$};
+\node[box, below=of dec] (score) {score $=$ Huber sum over 5 $+$ merchant CE $+$ device CE \quad (no KL)};
+\node[box, below=of score] (flag) {high-risk iff score $\ge 2.1162$ on the recorded run};
+\draw[arr] (raw) -- (prep);
+\draw[arr] (prep) -- (enc);
+\draw[arr] (enc) -- (z);
+\draw[arr] (z) -- (dec);
+\draw[arr] (dec) -- (score);
+\draw[arr] (score) -- (flag);
+\end{tikzpicture}
+\caption{One row through \texttt{TabularVAE} and \texttt{ReconstructionScorer}.
+The threshold is data from the calibration split, not a layer.}
+\end{figure}
+
+\section{Common misconceptions}
+
+\begin{enumerate}
+\item \textbf{This is not a supervised fraud classifier.}
+\texttt{VAETrainer} drops $y$. There is no sigmoid over ``fraud'' and no
+cross-entropy against the label. The label appears only in
+\texttt{detection\_report}, after scores exist.
+
+\item \textbf{The decoder does not output a fraud probability.}
+It outputs five scaled continuous numbers and two logit vectors, of
+lengths 10 and 3. A softmax is not even applied in \texttt{model.py}.
+
+\item \textbf{The reconstruction score is not a calibrated probability
+of fraud.} It is a sum of Huber residuals and cross-entropies in the
+scaled space. Threshold 2.1162 means ``at or above the 95th percentile
+of 1{,}200 normal calibration rows in this run.'' It does not mean
+``probability 0.95.''
+
+\item \textbf{KL is a training regularizer, not part of the score.}
+It shapes $q_{\phi}(z \mid x)$ while the weights are being fit. At
+epoch 25 its weighted value was the largest training term.
+\texttt{reconstruction\_errors} never adds it.
+
+\item \textbf{The threshold is not recomputed per request}, and it is
+not fit on the rows you report metrics on. \texttt{fit\_threshold}
+refuses a frame that contains a fraud label.
+
+\item \textbf{One-hot order is part of the model.} Merchant block, then
+device block, class index equal to vocab position. A swapped vocab is a
+different network than the one that was trained.
+\end{enumerate}
+
+\section{Trace through the code}
+
+Follow the on-manifold example from the notebook cell that calls
+\texttt{score}.
+
+\begin{enumerate}
+\item \texttt{dataset.py}: \texttt{generate\_synthetic\_transactions}
+builds the table. \texttt{TransactionDataModule} splits it, fits
+\texttt{ContinuousPreprocessor} on train normals, and yields
+\texttt{(continuous, categorical, labels)} from \texttt{TransactionDataset}.
+The training loader is normal rows only.
+
+\item \texttt{model.py}: \texttt{TabularVAE.forward} calls
+\texttt{encode} (concat to 18, trunk to $h_{2}$, then $\mu$ and
+\texttt{logvar}), \texttt{reparameterize}, and \texttt{decode} (trunk
+from $z$, then the 5-, 10-, and 3-wide heads).
+
+\item \texttt{loss.py}: \texttt{VAELoss.forward} computes the mean Huber,
+the summed per-head mean cross-entropies, the batch-mean KL, and
+\texttt{total} with $\lambda_{\mathrm{cont}}$, $\lambda_{\mathrm{cat}}$,
+and $\beta$ from \texttt{LossConfig}.
+
+\item \texttt{train.py}: \texttt{set\_seed(42)} seeds Python, NumPy, and
+PyTorch. \texttt{VAETrainer.fit} runs Adam for 25 epochs and prints the
+four scalars. The label tensor is bound to \texttt{\_labels} and unused.
+
+\item \texttt{score.py}: \texttt{ReconstructionScorer.fit\_threshold}
+on the calibration frame stores 2.1162.
+\texttt{score} builds a one-row frame, reuses
+\texttt{reconstruction\_errors} (preprocess, \texttt{encode},
+\texttt{decode(mu)}, per-row sum), and sets \texttt{high\_risk} by
+comparing to the stored threshold. \texttt{score\_batch} is that path
+over a list.
+
+\item The notebook wires those calls in order: data, \texttt{TabularVAE},
+\texttt{VAELoss}, \texttt{VAETrainer}, then \texttt{ReconstructionScorer}.
+The shape check before training decodes $\mu$ and does not draw
+$\epsilon$, so it does not consume the reparameterization noise the
+trainer is about to use.
+\end{enumerate}
+
+\end{document}
